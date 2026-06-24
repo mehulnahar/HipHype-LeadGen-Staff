@@ -397,6 +397,8 @@ def find_leads(cfg):
 PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>HipHype Lead Finder</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="alternate icon" href="/favicon.ico">
 <style>
 :root{--bg:#0f1115;--card:#171a21;--line:#262b36;--txt:#e6e8ee;--mut:#9aa3b2;--acc:#5b8cff;--good:#3fb950}
 *{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt)}
@@ -525,6 +527,15 @@ async function loadSaved(){try{const r=await fetch('/api/leads');const j=await r
 loadSaved();
 </script></body></html>"""
 
+# Yellow favicon (rounded square + dark "H" for HipHype), served inline — no binary file needed.
+FAVICON = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+    '<rect width="64" height="64" rx="14" fill="#FFD21E"/>'
+    '<text x="32" y="47" font-family="Segoe UI,Arial,sans-serif" font-size="44" '
+    'font-weight="700" text-anchor="middle" fill="#14161b">H</text>'
+    '</svg>'
+).encode()
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def _send(self, code, ctype, body):
@@ -533,6 +544,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/" or self.path.startswith("/?"):
             self._send(200, "text/html; charset=utf-8", PAGE.encode())
+        elif self.path in ("/favicon.svg", "/favicon.ico"):
+            self._send(200, "image/svg+xml", FAVICON)
         elif self.path == "/api/leads":
             self._send(200, "application/json", json.dumps({"leads": _load_leads()}).encode())
         else:
