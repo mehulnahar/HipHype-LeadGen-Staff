@@ -394,142 +394,103 @@ PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <style>
 :root{--bg:#0f1115;--card:#171a21;--line:#262b36;--txt:#e6e8ee;--mut:#9aa3b2;--acc:#5b8cff;--good:#3fb950}
 *{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt)}
-header{padding:18px 24px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}
-h1{font-size:18px;margin:0}.sub{color:var(--mut);font-size:12px}
-.wrap{padding:20px 24px;max-width:1400px;margin:0 auto}
-.panel{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:18px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
-label{display:block;font-size:12px;color:var(--mut);margin-bottom:4px}
-input,select{width:100%;padding:8px 10px;background:#0f1218;border:1px solid var(--line);border-radius:7px;color:var(--txt)}
-button{background:var(--acc);color:#fff;border:0;padding:10px 18px;border-radius:8px;font-weight:600;cursor:pointer}
+header{padding:13px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px}
+h1{font-size:16px;margin:0}.sub{color:var(--mut);font-size:12px}
+button{background:var(--acc);color:#fff;border:0;padding:7px 14px;border-radius:7px;font-weight:600;cursor:pointer;font-size:13px}
 button.sec{background:#222836;color:var(--txt);border:1px solid var(--line)}
-button:disabled{opacity:.5;cursor:wait}
-.row{display:flex;gap:10px;align-items:center;margin-top:14px;flex-wrap:wrap}
-table{width:100%;border-collapse:collapse;margin-top:8px}
-th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top;font-size:13px}
-th{color:var(--mut);font-weight:600;position:sticky;top:0;background:var(--card)}
-#tbl tr:hover td{background:#1b2029}
 a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+.muted{color:var(--mut)}
 .tag{font-size:11px;padding:2px 7px;border-radius:20px;background:#1c2330;color:var(--mut)}
 .tag.ok{background:#10301a;color:var(--good)}
-.jd{max-width:340px;color:var(--mut);font-size:12px}
-.jd summary{cursor:pointer;color:var(--acc)}
-.muted{color:var(--mut)}.status{margin-left:8px;color:var(--mut)}
+.layout{display:flex;height:calc(100vh - 51px)}
+.left{width:38%;max-width:520px;overflow:auto;border-right:1px solid var(--line)}
+.right{flex:1;overflow:auto;padding:22px 28px}
+.lead{padding:11px 16px;border-bottom:1px solid var(--line);cursor:pointer;border-left:3px solid transparent}
+.lead:hover{background:#1b2029}
+.lead.sel{background:#1d2533;border-left-color:var(--acc)}
+.lead .co{font-weight:600}
+.lead .meta{color:var(--mut);font-size:12px;margin-top:2px}
+.fit{font-weight:700;color:var(--good)}
+.dm{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:8px}
+.dm .nm{font-weight:600}
+.kv{margin:16px 0}.kv .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:5px}
+.opener{background:#0f1218;border:1px solid var(--line);border-radius:8px;padding:12px;white-space:pre-wrap}
+h2{margin:0 0 2px;font-size:20px}
 </style></head><body>
-<header><h1>HipHype Lead Finder</h1><span class="sub">funded · right-sized · hiring · worldwide</span></header>
-<div class="wrap">
-  <div class="panel">
-    <div class="grid">
-      <div><label>Min employees</label><input id="size_min" type="number" value="20"></div>
-      <div><label>Max employees</label><input id="size_max" type="number" value="200"></div>
-      <div><label>Funded since</label><input id="funded_since" type="date" value="2026-04-01"></div>
-      <div><label>Industry</label><input id="industry" value="Software Development"></div>
-      <div><label>HQ country (optional)</label><input id="country" placeholder="e.g. United Kingdom"></div>
-      <div><label>Max results</label><input id="max_results" type="number" value="10" min="1" max="25"></div>
-    </div>
-    <div class="row">
-      <button id="find" onclick="run()">Find Leads</button>
-      <button class="sec" onclick="csv()">Export CSV</button>
-      <span class="status" id="status"></span>
-    </div>
-  </div>
-  <div class="panel" id="resultPanel" style="display:none">
-    <div id="count" class="muted"></div>
-    <div style="overflow:auto;max-height:70vh"><table id="tbl"></table></div>
-  </div>
+<header>
+  <h1>HipHype Lead Finder</h1>
+  <span class="sub" id="count">loading...</span>
+  <span style="flex:1"></span>
+  <button class="sec" onclick="loadSaved()">Refresh</button>
+  <button class="sec" onclick="csv()">Export CSV</button>
+</header>
+<div class="layout">
+  <div class="left" id="list"></div>
+  <div class="right" id="detail"><span class="muted">Select a lead on the left.</span></div>
 </div>
 <script>
 let LEADS=[];
 const $=id=>document.getElementById(id);
-function cfg(){return {size_min:+$('size_min').value,size_max:+$('size_max').value,funded_since:$('funded_since').value,industry:$('industry').value,country:$('country').value,max_results:+$('max_results').value};}
-async function run(){
-  const b=$('find'); b.disabled=true; $('status').textContent='Searching… (full pipeline, ~30–60s)';
-  try{
-    const r=await fetch('/api/find-leads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg())});
-    const j=await r.json();
-    if(j.error){$('status').textContent='Error: '+j.error; b.disabled=false; return;}
-    LEADS=j.leads||[]; render();
-    $('status').textContent='Done — '+LEADS.length+' leads.';
-  }catch(e){$('status').textContent='Error: '+e;}
-  b.disabled=false;
-}
-// Safe DOM helpers (no innerHTML with untrusted data)
-function cell(text){const td=document.createElement('td');td.textContent=(text==null?'':String(text));return td;}
-function link(text,href){const a=document.createElement('a');a.href=href;a.target='_blank';a.rel='noopener noreferrer';a.textContent=text;return a;}
 function safeUrl(u){return (typeof u==='string'&&/^https?:\/\//i.test(u))?u:null;}
+function link(text,href){const a=document.createElement('a');a.href=href;a.target='_blank';a.rel='noopener noreferrer';a.textContent=text;return a;}
 function gsearch(dm){return 'https://www.google.com/search?q='+encodeURIComponent(((dm.name||'')+' '+(dm.company||'')+' site:linkedin.com/in').trim());}
-function render(){
-  $('resultPanel').style.display='block';
-  $('count').textContent=LEADS.length+' qualified leads';
-  const tbl=$('tbl'); tbl.replaceChildren();
-  const head=document.createElement('tr');
-  ['Company','What they do','HQ','Size','Funding','Fit','Role','Posted','Decision-makers (to connect)','Opener'].forEach(c=>{const th=document.createElement('th');th.textContent=c;head.appendChild(th);});
-  tbl.appendChild(head);
-  for(const l of LEADS){
-    const tr=document.createElement('tr');
-    // company + website
-    const c0=document.createElement('td');const b=document.createElement('b');b.textContent=l.company||'';c0.appendChild(b);
-    if(l.website){c0.appendChild(document.createElement('br'));const s=document.createElement('span');s.className='muted';s.textContent=l.website;c0.appendChild(s);}
-    tr.appendChild(c0);
-    // product / what they do (Z.ai summary)
-    const pc=document.createElement('td');pc.className='jd';pc.style.maxWidth='280px';pc.textContent=l.product||'';tr.appendChild(pc);
-    tr.appendChild(cell(l.hq));
-    tr.appendChild(cell(l.employees));
-    // funding (structured: amount / round / date)
-    const fc=document.createElement('td');
-    if(l.funding_amount){const a=document.createElement('div');a.style.fontWeight='700';a.textContent=l.funding_amount;fc.appendChild(a);}
-    if(l.funding_round){const t=document.createElement('span');t.className='tag';t.textContent=l.funding_round;fc.appendChild(t);}
-    if(l.funding_date){const dd=document.createElement('div');dd.className='muted';dd.style.fontSize='11px';dd.style.marginTop='3px';dd.textContent=l.funding_date;fc.appendChild(dd);}
-    if(!l.funding_amount&&!l.funding_round){fc.textContent=l.funding||'';}
-    tr.appendChild(fc);
-    // fit (agent score + reason)
-    const ftc=document.createElement('td');
-    if(l.fit_score){const b=document.createElement('div');b.style.fontWeight='700';b.textContent=l.fit_score+'/10';ftc.appendChild(b);}
-    if(l.fit_reason){const s=document.createElement('div');s.className='muted';s.style.fontSize='11px';s.textContent=l.fit_reason;ftc.appendChild(s);}
-    tr.appendChild(ftc);
-    // role: link + active tag
-    const rc=document.createElement('td');const ju=safeUrl(l.job_link);
-    if(ju) rc.appendChild(link(l.job_title||'role',ju)); else rc.appendChild(document.createTextNode(l.job_title||''));
-    const tag=document.createElement('span');tag.className='tag'+(l.job_active==1?' ok':'');tag.textContent=(l.job_active==1?'active':'check');
-    rc.appendChild(document.createTextNode(' '));rc.appendChild(tag);tr.appendChild(rc);
-    tr.appendChild(cell((l.job_posted||'').slice(0,10)));
-    // decision-makers to connect with (CEO/CTO/VP Eng + LinkedIn + email)
-    const dc=document.createElement('td');
-    const dms=l.decision_makers||[];
-    if(dms.length){
-      dms.forEach(dm=>{
-        const blk=document.createElement('div');blk.style.marginBottom='8px';
-        const nm=document.createElement('div');nm.style.fontWeight='600';nm.textContent=dm.name||'';blk.appendChild(nm);
-        if(dm.title){const tt=document.createElement('div');tt.className='muted';tt.style.fontSize='11px';tt.textContent=dm.title;blk.appendChild(tt);}
-        const ln=document.createElement('div');ln.style.fontSize='12px';
-        const lu=safeUrl(dm.linkedin)||gsearch(dm);
-        if(lu) ln.appendChild(link(safeUrl(dm.linkedin)?'Connect':'Find on LinkedIn',lu));
-        if(dm.email){ln.appendChild(document.createTextNode(' · '));const em=document.createElement('span');em.textContent=dm.email;ln.appendChild(em);}
-        if(dm.phone){ln.appendChild(document.createTextNode(' · '));const ph=document.createElement('span');ph.textContent=dm.phone;ln.appendChild(ph);}
-        blk.appendChild(ln);
-        const btn=document.createElement('button');btn.className='sec';btn.style.cssText='padding:2px 8px;font-size:11px;margin-top:3px';btn.textContent='Enrich';
-        btn.onclick=async()=>{btn.disabled=true;btn.textContent='…';try{const r=await fetch('/api/enrich',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:dm.name,company:dm.company,linkedin:dm.linkedin})});const j=await r.json();ln.textContent='';const lu2=safeUrl(j.linkedin)||gsearch(dm);if(lu2)ln.appendChild(link(j.linkedin?'Connect':'Find on LinkedIn',lu2));if(j.email){ln.appendChild(document.createTextNode(' · '));const em=document.createElement('span');em.textContent=j.email;ln.appendChild(em);}if(j.phone){ln.appendChild(document.createTextNode(' · '));const ph=document.createElement('span');ph.textContent=j.phone;ln.appendChild(ph);}if(!j.email&&!j.phone){const s=document.createElement('span');s.className='muted';s.textContent=' no contact found';ln.appendChild(s);}btn.style.display='none';}catch(e){btn.textContent='err';btn.disabled=false;}};
-        blk.appendChild(btn);
-        dc.appendChild(blk);
-      });
-    } else { dc.appendChild(document.createTextNode('—')); }
-    tr.appendChild(dc);
-    // jd (collapsible, textContent only)
-    const oc=document.createElement('td');oc.className='jd';oc.style.maxWidth='320px';
-    if(l.opener){const det=document.createElement('details');const sum=document.createElement('summary');sum.textContent='opener';det.appendChild(sum);const div=document.createElement('div');div.style.marginTop='4px';div.textContent=l.opener;det.appendChild(div);oc.appendChild(det);}
-    tr.appendChild(oc);
-    tbl.appendChild(tr);
+function kv(label,node){const w=document.createElement('div');w.className='kv';const k=document.createElement('div');k.className='k';k.textContent=label;w.appendChild(k);if(typeof node==='string'){const v=document.createElement('div');v.textContent=node;w.appendChild(v);}else if(node){w.appendChild(node);}return w;}
+function renderList(){
+  $('count').textContent=LEADS.length+' leads';
+  const list=$('list'); list.replaceChildren();
+  LEADS.forEach((l,i)=>{
+    const d=document.createElement('div'); d.className='lead';
+    const co=document.createElement('div'); co.className='co'; co.textContent=l.company||''; d.appendChild(co);
+    const m=document.createElement('div'); m.className='meta'; const bits=[];
+    if(l.fit_score) bits.push('fit '+l.fit_score+'/10');
+    if(l.funding_amount) bits.push(l.funding_amount+' '+(l.funding_round||''));
+    if(l.hq) bits.push(l.hq);
+    m.textContent=bits.join('  ·  '); d.appendChild(m);
+    if(l.job_title){const r=document.createElement('div');r.className='meta';r.textContent='hiring: '+l.job_title;d.appendChild(r);}
+    d.onclick=()=>{document.querySelectorAll('.lead').forEach(x=>x.classList.remove('sel'));d.classList.add('sel');showDetail(l);};
+    list.appendChild(d);
+  });
+  if(LEADS.length){ list.firstChild.classList.add('sel'); showDetail(LEADS[0]); }
+}
+function showDetail(l){
+  const D=$('detail'); D.replaceChildren();
+  const h=document.createElement('h2'); h.textContent=l.company||''; D.appendChild(h);
+  if(l.website){const w=document.createElement('div');w.appendChild(link(l.website, safeUrl(l.website)||('https://'+l.website)));D.appendChild(w);}
+  const top=document.createElement('div'); top.style.margin='10px 0';
+  if(l.fit_score){const f=document.createElement('span');f.className='fit';f.textContent='Fit '+l.fit_score+'/10';top.appendChild(f);if(l.fit_reason){const s=document.createElement('span');s.className='muted';s.textContent='   '+l.fit_reason;top.appendChild(s);}}
+  D.appendChild(top);
+  if(l.funding_amount||l.funding) D.appendChild(kv('Funding', l.funding_amount?(l.funding_amount+' · '+(l.funding_round||'')+' · '+(l.funding_date||'')):l.funding));
+  if(l.product) D.appendChild(kv('What they do', l.product));
+  if(l.job_title){const rc=document.createElement('div');const ju=safeUrl(l.job_link);if(ju)rc.appendChild(link(l.job_title,ju));else rc.textContent=l.job_title;D.appendChild(kv('Hiring (role)', rc));}
+  if((l.decision_makers||[]).length){
+    const box=document.createElement('div');
+    l.decision_makers.forEach(dm=>{
+      const c=document.createElement('div');c.className='dm';
+      const nm=document.createElement('div');nm.className='nm';nm.textContent=dm.name||'';c.appendChild(nm);
+      if(dm.title){const t=document.createElement('div');t.className='muted';t.style.fontSize='12px';t.textContent=dm.title;c.appendChild(t);}
+      const ln=document.createElement('div');ln.style.fontSize='13px';ln.style.marginTop='4px';
+      const lu=safeUrl(dm.linkedin)||gsearch(dm);
+      if(lu)ln.appendChild(link(safeUrl(dm.linkedin)?'Connect':'Find on LinkedIn',lu));
+      if(dm.email){ln.appendChild(document.createTextNode(' · '));const e=document.createElement('span');e.textContent=dm.email;ln.appendChild(e);}
+      if(dm.phone){ln.appendChild(document.createTextNode(' · '));const p=document.createElement('span');p.textContent=dm.phone;ln.appendChild(p);}
+      c.appendChild(ln);
+      const btn=document.createElement('button');btn.className='sec';btn.style.cssText='padding:3px 10px;font-size:11px;margin-top:6px';btn.textContent='Enrich (email + phone)';
+      btn.onclick=async()=>{btn.disabled=true;btn.textContent='...';try{const r=await fetch('/api/enrich',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:dm.name,company:dm.company,linkedin:dm.linkedin})});const j=await r.json();ln.textContent='';const lu2=safeUrl(j.linkedin)||gsearch(dm);if(lu2)ln.appendChild(link(j.linkedin?'Connect':'Find on LinkedIn',lu2));if(j.email){ln.appendChild(document.createTextNode(' · '));const e=document.createElement('span');e.textContent=j.email;ln.appendChild(e);}if(j.phone){ln.appendChild(document.createTextNode(' · '));const p=document.createElement('span');p.textContent=j.phone;ln.appendChild(p);}if(!j.email&&!j.phone){const s=document.createElement('span');s.className='muted';s.textContent=' no contact found';ln.appendChild(s);}btn.style.display='none';}catch(e){btn.textContent='err';btn.disabled=false;}};
+      c.appendChild(btn);box.appendChild(c);
+    });
+    D.appendChild(kv('Decision-makers (to connect)', box));
   }
+  if(l.opener){const o=document.createElement('div');o.className='opener';o.textContent=l.opener;D.appendChild(kv('Outreach opener', o));}
 }
 function csv(){
-  if(!LEADS.length){alert('Run a search first');return;}
-  const cols=['company','product','fit_score','fit_reason','opener','hq','employees','funding','job_title','job_link','job_posted','buyer','buyer_title','linkedin','email','phone','jd'];
+  if(!LEADS.length){alert('No data yet');return;}
+  const cols=['company','product','fit_score','fit_reason','opener','hq','employees','funding','job_title','job_link','job_posted','buyer','buyer_title','linkedin','email','phone'];
   const esc=v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"';
   const rows=[cols.join(',')].concat(LEADS.map(l=>cols.map(c=>esc(l[c])).join(',')));
   const blob=new Blob([rows.join('\n')],{type:'text/csv'});
   const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='leads.csv'; a.click();
 }
-async function loadSaved(){try{const r=await fetch('/api/leads');const j=await r.json();if(j.leads&&j.leads.length){LEADS=j.leads;render();$('status').textContent='Loaded '+LEADS.length+' stored leads (auto-updated by the daily 9 AM run).';}}catch(e){}}
+async function loadSaved(){try{const r=await fetch('/api/leads');const j=await r.json();LEADS=j.leads||[];renderList();if(!LEADS.length)$('count').textContent='no leads yet (the daily run will populate)';}catch(e){$('count').textContent='error loading';}}
 loadSaved();
 </script></body></html>"""
 
