@@ -424,41 +424,19 @@ a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 </style></head><body>
 <header><h1>HipHype Lead Finder</h1><span class="sub">funded · right-sized · hiring · worldwide</span></header>
 <div class="wrap">
-  <div class="panel">
-    <div class="grid">
-      <div><label>Min employees</label><input id="size_min" type="number" value="20"></div>
-      <div><label>Max employees</label><input id="size_max" type="number" value="200"></div>
-      <div><label>Funded since</label><input id="funded_since" type="date" value="2026-04-01"></div>
-      <div><label>Industry</label><input id="industry" value="Software Development"></div>
-      <div><label>HQ country (optional)</label><input id="country" placeholder="e.g. United Kingdom"></div>
-      <div><label>Max results</label><input id="max_results" type="number" value="10" min="1" max="25"></div>
-    </div>
-    <div class="row">
-      <button id="find" onclick="run()">Find Leads</button>
+  <div class="panel" id="resultPanel">
+    <div class="row" style="margin-top:0;margin-bottom:10px">
       <button class="sec" onclick="csv()">Export CSV</button>
+      <button class="sec" onclick="loadSaved()">Refresh</button>
       <span class="status" id="status"></span>
     </div>
-  </div>
-  <div class="panel" id="resultPanel" style="display:none">
     <div id="count" class="muted"></div>
-    <div style="overflow:auto;max-height:70vh"><table id="tbl"></table></div>
+    <div style="overflow:auto;max-height:80vh"><table id="tbl"></table></div>
   </div>
 </div>
 <script>
 let LEADS=[];
 const $=id=>document.getElementById(id);
-function cfg(){return {size_min:+$('size_min').value,size_max:+$('size_max').value,funded_since:$('funded_since').value,industry:$('industry').value,country:$('country').value,max_results:+$('max_results').value};}
-async function run(){
-  const b=$('find'); b.disabled=true; $('status').textContent='Searching… (full pipeline, ~30–60s)';
-  try{
-    const r=await fetch('/api/find-leads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg())});
-    const j=await r.json();
-    if(j.error){$('status').textContent='Error: '+j.error; b.disabled=false; return;}
-    LEADS=j.leads||[]; render();
-    $('status').textContent='Done — '+LEADS.length+' leads.';
-  }catch(e){$('status').textContent='Error: '+e;}
-  b.disabled=false;
-}
 // Safe DOM helpers (no innerHTML with untrusted data)
 function cell(text){const td=document.createElement('td');td.textContent=(text==null?'':String(text));return td;}
 function link(text,href){const a=document.createElement('a');a.href=href;a.target='_blank';a.rel='noopener noreferrer';a.textContent=text;return a;}
@@ -543,7 +521,7 @@ function csv(){
   const blob=new Blob([rows.join('\n')],{type:'text/csv'});
   const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='leads.csv'; a.click();
 }
-async function loadSaved(){try{const r=await fetch('/api/leads');const j=await r.json();if(j.leads&&j.leads.length){LEADS=j.leads;render();$('status').textContent='Loaded '+LEADS.length+' stored leads (auto-updated by the daily 9 AM run).';}}catch(e){}}
+async function loadSaved(){try{const r=await fetch('/api/leads');const j=await r.json();LEADS=j.leads||[];if(LEADS.length){render();$('status').textContent='Loaded '+LEADS.length+' stored leads (auto-updated by the daily 9 AM run).';}else{$('count').textContent='No leads yet — the daily 9 AM run will populate this automatically.';$('status').textContent='';}}catch(e){$('count').textContent='Error loading leads.';}}
 loadSaved();
 </script></body></html>"""
 
