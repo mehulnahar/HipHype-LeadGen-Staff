@@ -350,6 +350,10 @@ def find_leads(cfg):
         if not job and posts:
             job = posts[0]
         jid = job.get("job_posting_id")
+        # hiring momentum (free, already in the company record) — open roles + monthly change
+        cc = d.get("active_job_postings_count_change") or {}
+        jobs_open = d.get("active_job_postings_count") or cc.get("current") or 0
+        jobs_change_m = cc.get("change_monthly")
         amt = lf.get("amount_raised")
         funding = " ".join(str(x) for x in [lf.get("type"), lf.get("announced_date"),
                   (f"${amt:,}" if isinstance(amt, int) else ""), lf.get("amount_raised_currency") or ""] if x).strip()
@@ -375,7 +379,8 @@ def find_leads(cfg):
             "job_title": job.get("job_posting_title") or "",
             "job_link": ("https://www.linkedin.com/jobs/view/" + str(jid)) if jid else "",
             "job_active": 1,
-            "job_posted": "",
+            "jobs_open": jobs_open,
+            "jobs_change_m": jobs_change_m,
             "jd": "",
             "buyer": b0.get("name", ""),
             "buyer_title": b0.get("title", ""),
@@ -463,7 +468,7 @@ function render(){
   $('count').textContent=LEADS.length+' qualified leads';
   const tbl=$('tbl'); tbl.replaceChildren();
   const head=document.createElement('tr');
-  ['Company','What they do','HQ','Size','Funding','Fit','Role','Posted','Decision-makers (to connect)','Opener'].forEach(c=>{const th=document.createElement('th');th.textContent=c;head.appendChild(th);});
+  ['Company','What they do','HQ','Size','Funding','Fit','Role','Hiring','Decision-makers (to connect)','Opener'].forEach(c=>{const th=document.createElement('th');th.textContent=c;head.appendChild(th);});
   tbl.appendChild(head);
   for(const l of LEADS){
     const tr=document.createElement('tr');
@@ -492,7 +497,15 @@ function render(){
     if(ju) rc.appendChild(link(l.job_title||'role',ju)); else rc.appendChild(document.createTextNode(l.job_title||''));
     const tag=document.createElement('span');tag.className='tag'+(l.job_active==1?' ok':'');tag.textContent=(l.job_active==1?'active':'check');
     rc.appendChild(document.createTextNode(' '));rc.appendChild(tag);tr.appendChild(rc);
-    tr.appendChild(cell((l.job_posted||'').slice(0,10)));
+    // hiring momentum: open roles + month-over-month change (replaces posted date)
+    const hc=document.createElement('td');
+    if(l.jobs_open!=null){
+      const n=document.createElement('div');n.style.fontWeight='700';n.textContent=l.jobs_open+(l.jobs_open==1?' role':' roles');hc.appendChild(n);
+      const ch=l.jobs_change_m;
+      if(ch!=null&&ch!==0){const t=document.createElement('div');t.style.fontSize='11px';t.style.marginTop='3px';t.style.color=ch>0?'var(--good)':'#e06c6c';t.textContent=(ch>0?'▲ +':'▼ ')+ch+'/mo';hc.appendChild(t);}
+      else if(ch===0){const t=document.createElement('div');t.className='muted';t.style.fontSize='11px';t.style.marginTop='3px';t.textContent='steady';hc.appendChild(t);}
+    } else { hc.textContent='—'; }
+    tr.appendChild(hc);
     // decision-makers to connect with (CEO/CTO/VP Eng + LinkedIn + email)
     const dc=document.createElement('td');
     const dms=l.decision_makers||[];
@@ -523,7 +536,7 @@ function render(){
 }
 function csv(){
   if(!LEADS.length){alert('Run a search first');return;}
-  const cols=['company','product','fit_score','fit_reason','opener','hq','employees','funding','job_title','job_link','job_posted','buyer','buyer_title','linkedin','email','phone','jd'];
+  const cols=['company','product','fit_score','fit_reason','opener','hq','employees','funding','job_title','job_link','jobs_open','jobs_change_m','buyer','buyer_title','linkedin','email','phone'];
   const esc=v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"';
   const rows=[cols.join(',')].concat(LEADS.map(l=>cols.map(c=>esc(l[c])).join(',')));
   const blob=new Blob([rows.join('\n')],{type:'text/csv'});
