@@ -1,0 +1,15 @@
+# secrets / config (never commit)
+.env
+*.env
+.mcp.json
+
+# local data (DB is the source of truth in prod)
+leads.json
+seen_companies.json
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
