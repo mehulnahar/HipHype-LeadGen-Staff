@@ -134,7 +134,7 @@ def _db():
         import psycopg2
         c = _DB.get("conn")
         if c is None or getattr(c, "closed", 1):
-            c = psycopg2.connect(DATABASE_URL)
+            c = psycopg2.connect(DATABASE_URL, connect_timeout=10)
             c.autocommit = True
             with c.cursor() as cur:
                 cur.execute("CREATE TABLE IF NOT EXISTS leads (company TEXT PRIMARY KEY, data TEXT, updated_at TIMESTAMP DEFAULT now())")
