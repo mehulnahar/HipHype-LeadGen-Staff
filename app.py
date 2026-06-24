@@ -11,6 +11,7 @@ Backend holds the API key (never exposed to the browser) and runs the
 discovery -> qualify -> buyer -> job/JD pipeline.
 """
 import os, re, json, ssl, urllib.request, urllib.error, urllib.parse
+import threading, time, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 API_KEY = os.environ.get("DATA_API_KEY", "")
@@ -579,18 +580,48 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "text/plain", b"not found")
 
+def _run_pipeline_once(tag="CRON"):
+    """Full discovery -> qualify -> personalize -> store run (used by --cron and the scheduler)."""
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    try:
+        ls = find_leads({})
+        _persist(ls)
+        print("%s %s: %d new leads this run; %d stored total" % (tag, stamp, len(ls), len(_load_leads())), flush=True)
+    except Exception as e:
+        print("%s %s error: %s" % (tag, stamp, e), flush=True)
+
+def _scheduler():
+    """Daily in-process cron: fires _run_pipeline_once at CRON_AT_UTC each day.
+    Default 03:30 UTC = 09:00 IST (the user's morning). Set CRON_AT_UTC=HH:MM to change."""
+    parts = os.environ.get("CRON_AT_UTC", "03:30").split(":")
+    try:
+        hh, mm = int(parts[0]), int(parts[1])
+    except Exception:
+        hh, mm = 3, 30
+    print("Daily scheduler ON — runs at %02d:%02d UTC each day." % (hh, mm), flush=True)
+    while True:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        nxt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if nxt <= now:
+            nxt += datetime.timedelta(days=1)
+        print("Next daily run: %s UTC" % nxt.strftime("%Y-%m-%d %H:%M"), flush=True)
+        while True:
+            secs = (nxt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+            if secs <= 0:
+                break
+            time.sleep(min(secs, 1800))   # wake at least every 30 min to stay accurate
+        _run_pipeline_once("CRON")
+        time.sleep(90)                    # avoid double-firing within the same minute
+
 if __name__ == "__main__":
     if not API_KEY:
         print("!! WARNING: DATA_API_KEY env var is not set — searches will fail.")
     import sys
     if "--cron" in sys.argv:
-        try:
-            ls = find_leads({})
-            _persist(ls)
-            print("CRON: %d new leads this run; %d stored total" % (len(ls), len(_load_leads())))
-        except Exception as e:
-            print("CRON error:", e)
+        _run_pipeline_once("CRON")
         sys.exit(0)
+    if os.environ.get("CRON_ENABLED", "1") != "0":
+        threading.Thread(target=_scheduler, daemon=True).start()
     port = int(os.environ.get("PORT", 8000))
     print("HipHype Lead Finder running on 0.0.0.0:%d" % port)
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()

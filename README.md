@@ -26,13 +26,22 @@ export DATA_API_KEY=... Z_AI_API_KEY=... CONTACTOUT_EMAIL_KEY=... CONTACTOUT_PHO
 python app.py            # -> http://localhost:8000
 ```
 
-## Daily run (cron)
+## Daily run (built-in scheduler)
+The web app has a **built-in daily scheduler** — no external cron needed. On startup it spawns a
+background thread that runs the full pipeline (discovery -> qualify -> personalize -> store) once
+per day and writes the results to the DB, so fresh leads are simply there each morning.
+
+| Var | Purpose | Default |
+|-----|---------|---------|
+| `CRON_AT_UTC` | Time of the daily run, `HH:MM` in **UTC** | `03:30` (= 09:00 IST) |
+| `CRON_ENABLED` | Set to `0` to disable the scheduler | `1` (on) |
+
+To change the time, set `CRON_AT_UTC` (e.g. `14:00` for 2 PM UTC). It survives restarts/redeploys —
+the thread just recomputes the next run.
+
+You can also trigger a one-off run from the CLI (e.g. an external cron, if you prefer):
 ```
-python app.py --cron     # discovery -> qualify -> personalize -> store
-```
-On a server, schedule it for 9 AM:
-```
-0 9 * * * cd /path/to/app && python3 app.py --cron >> cron.log 2>&1
+python app.py --cron     # runs the pipeline once and exits
 ```
 
 ## Deploy (Railway)
