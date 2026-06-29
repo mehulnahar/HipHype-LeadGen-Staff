@@ -8,6 +8,9 @@ leads.json
 seen_companies.json
 outreach.json
 
+# tooling scratch
+.playwright-mcp/
+
 # python
 __pycache__/
 *.pyc
