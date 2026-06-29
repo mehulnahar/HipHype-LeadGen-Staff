@@ -19,6 +19,24 @@ Agentic lead-generation tool for IT staff augmentation. Discovers funded, right-
 | `DATABASE_URL` | Postgres connection string (auto-set by Railway) |
 | `PORT` | HTTP port (auto-set by Railway; default 8000) |
 
+### LinkedIn Outreach (`/outreach`)
+| Var | Purpose | Default |
+|-----|---------|---------|
+| `AGENCY_NAME` | Agency name in outreach copy | `HipHype Tech` |
+| `SENDER_NAME` | Sender / sign-off name | `Ashish` |
+| `LINKEDIN_FOLLOWUP_DAYS` | Count + spacing of auto follow-ups | `1,1,1` |
+| `QUALITY_FILTER` | `off` disables the lead quality gate | `on` |
+| `MIN_FIT` | Min lead `fit_score` to queue for outreach | `6` |
+| `STALE_INVITE_DAYS` | Flag unaccepted invites older than this | `30` |
+| `NOTE_MODEL` | GLM model for note/messages/auto follow-ups | `glm-4.5-air` |
+| `REPLY_MODEL` | GLM model for the 3 "Interested" follow-ups | `glm-4.6` |
+
+The **`/outreach`** page is a manual, AI-assisted worklist: it pulls qualified leads, writes the
+LinkedIn copy for each stage (connection note → first message → follow-ups), tracks each prospect
+through a 7-stage pipeline, and tells you exactly what to copy-paste into LinkedIn. **Nothing is
+auto-sent** — you send every message by hand (there is no official LinkedIn send API). The daily 9 AM
+run auto-queues newly found leads; you can also click "Sync from leads" anytime.
+
 ## Run locally
 ```
 pip install -r requirements.txt        # only needed if using Postgres

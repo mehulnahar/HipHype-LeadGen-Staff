@@ -62,11 +62,11 @@ def _fmt_date(d):
 
 ZAI_KEY = os.environ.get("Z_AI_API_KEY", "")
 ZAI_URL = "https://api.z.ai/api/paas/v4/chat/completions"
-def _zai_chat(prompt, max_tokens=130, temp=0.2):
+def _zai_chat(prompt, max_tokens=130, temp=0.2, model="glm-4.5-air"):
     """One Z.ai GLM chat call -> plain text content (or '' on failure)."""
     if not ZAI_KEY:
         return ""
-    body = {"model": "glm-4.5-air", "messages": [{"role": "user", "content": prompt}],
+    body = {"model": model, "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens, "temperature": temp, "thinking": {"type": "disabled"}}
     try:
         r = urllib.request.Request(ZAI_URL, data=json.dumps(body).encode(),
@@ -140,6 +140,7 @@ def _db():
             with c.cursor() as cur:
                 cur.execute("CREATE TABLE IF NOT EXISTS leads (company TEXT PRIMARY KEY, data TEXT, updated_at TIMESTAMP DEFAULT now())")
                 cur.execute("CREATE TABLE IF NOT EXISTS seen_companies (id BIGINT PRIMARY KEY)")
+                cur.execute("CREATE TABLE IF NOT EXISTS outreach (id TEXT PRIMARY KEY, data TEXT, updated_at TIMESTAMP DEFAULT now())")
             _DB["conn"] = c
         return c
     except Exception as e:
@@ -394,6 +395,322 @@ def find_leads(cfg):
     _save_seen(seen)
     return leads
 
+# ============================ LinkedIn Outreach (manual, AI-assisted) ============================
+# A worklist that picks good leads, writes the copy for each stage, tracks pipeline position, and tells
+# the operator exactly what to paste into LinkedIn. Nothing is auto-sent — one human sends by hand.
+import time as _time
+
+AGENCY        = os.environ.get("AGENCY_NAME", "HipHype Tech")
+SENDER        = os.environ.get("SENDER_NAME", "Ashish")
+FOLLOWUP_DAYS = [int(x) for x in os.environ.get("LINKEDIN_FOLLOWUP_DAYS", "1,1,1").split(",") if x.strip().isdigit()] or [1, 1, 1]
+MAX_FOLLOWUPS = len(FOLLOWUP_DAYS)
+STALE_INVITE_DAYS = int(os.environ.get("STALE_INVITE_DAYS", "30"))
+QUALITY_FILTER = os.environ.get("QUALITY_FILTER", "on").lower() != "off"
+MIN_FIT       = int(os.environ.get("MIN_FIT", "6"))
+NOTE_MODEL    = os.environ.get("NOTE_MODEL", "glm-4.5-air")
+REPLY_MODEL   = os.environ.get("REPLY_MODEL", "glm-4.6")
+DAY = 86400
+
+def _strip_dashes(s):
+    return re.sub(r", ,", ",", re.sub(r"\s*[—–]\s*", ", ", str(s or ""))).strip()
+
+OUTREACH_FILE = os.path.join(_BASE_DIR, "outreach.json")
+
+def _load_outreach():
+    c = _db()
+    if c:
+        try:
+            with c.cursor() as cur:
+                cur.execute("SELECT data FROM outreach ORDER BY updated_at DESC")
+                return [json.loads(r[0]) for r in cur.fetchall()]
+        except Exception:
+            return []
+    try:
+        with open(OUTREACH_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def _save_outreach_row(row):
+    row["updated"] = _time.time()
+    c = _db()
+    if c:
+        try:
+            with c.cursor() as cur:
+                cur.execute("INSERT INTO outreach (id, data, updated_at) VALUES (%s,%s,now()) "
+                            "ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data, updated_at=now()",
+                            (row.get("company") or "", json.dumps(row)))
+        except Exception as e:
+            print("save_outreach error:", e)
+        return
+    rows = [r for r in _load_outreach() if r.get("company") != row.get("company")]
+    rows.append(row)
+    try:
+        with open(OUTREACH_FILE, "w", encoding="utf-8") as f:
+            json.dump(rows, f)
+    except Exception:
+        pass
+
+def _get_outreach(company):
+    for r in _load_outreach():
+        if r.get("company") == company:
+            return r
+    return None
+
+def _first_name(name):
+    n = (name or "").strip()
+    return n.split(" ")[0] if n else ""
+
+def _pick_dm(lead):
+    """Decision-maker to contact: prefer one with a real /in/ LinkedIn, else the first."""
+    dms = lead.get("decision_makers") or []
+    for dm in dms:
+        if "/in/" in (dm.get("linkedin") or ""):
+            return dm
+    return dms[0] if dms else {}
+
+def _passes_gate(lead, dm):
+    if not _first_name(dm.get("name")):          # name guard: never "Hi there"
+        return False
+    if not QUALITY_FILTER:
+        return True
+    return int(lead.get("fit_score") or 0) >= MIN_FIT
+
+def _outreach_intake():
+    """Promote qualifying leads into 'queued' rows. Never overwrites existing rows (preserves progress)."""
+    existing = {r.get("company") for r in _load_outreach()}
+    created = 0
+    for lead in _load_leads():
+        comp = lead.get("company")
+        if not comp or comp in existing:
+            continue
+        dm = _pick_dm(lead)
+        if not _passes_gate(lead, dm):
+            continue
+        _save_outreach_row({
+            "company": comp, "first_name": _first_name(dm.get("name")),
+            "dm_name": dm.get("name") or "", "dm_title": dm.get("title") or "",
+            "linkedin_url": dm.get("linkedin") if "/in/" in (dm.get("linkedin") or "") else "",
+            "linkedin_search": dm.get("linkedin_search") or "",
+            "job_title": lead.get("job_title") or "", "product": lead.get("product") or "",
+            "fit_score": lead.get("fit_score") or 0, "status": "queued",
+            "connection_note": "", "messages": [], "connection_sent_at": None, "connected_at": None,
+            "followup_due_at": None, "followup_count": 0, "interested": False, "interested_at": None,
+            "last_reply_text": "", "scheduled": False, "scheduled_messages": [], "closed_at": None,
+            "created_at": _time.time(),
+        })
+        existing.add(comp); created += 1
+    return created
+
+# --- AI copy (Z.ai GLM); every output passes through the dash-stripper ---
+SHARED_RULES = (
+    "Style: warm, curious, genuinely human, like a real person who read about them, NOT a vendor pitching. "
+    "Do NOT: make performance claims or use numbers/percentages; use buzzwords (essence, elevate, unlock, captivate, "
+    "drive, stunning, seamless, leverage, supercharge, game-changing); write 'we specialize in'; give prescriptive "
+    "'you should do X'; use the word 'available'; offer to send a Loom, case study, portfolio, samples or any attachment. "
+    "Do NOT use em dashes or en dashes; use commas or periods. CTA: gently propose a quick call at 11 AM their time "
+    "tomorrow, and clearly leave it to them (\"no pressure if that doesn't suit\")."
+)
+
+def _ctx(row):
+    return {"FN": row.get("first_name") or "there", "ROLE": row.get("dm_title") or "",
+            "JOB": row.get("job_title") or "", "DESC": (row.get("product") or "")[:800], "COMP": row.get("company") or ""}
+
+def _gen_note(row):
+    c = _ctx(row); role = (", " + c["ROLE"]) if c["ROLE"] else ""
+    prompt = (
+        "You are writing a short LinkedIn connection-request note (the 'add a note' field, sent WITH the invite).\n\n"
+        "Sender: %s from %s (IT staff augmentation, offshore engineers placed with global clients)\n"
+        "Recipient: %s%s at %s\nWhat their company does: %s\nThey are hiring: %s\n\n"
+        "Write the note in EXACTLY this structure:\n\n"
+        "<TOPIC LINE: a concise plain-language summary of what their company does or is hiring for. Max 60 characters. No 'Subject' label.>\n\n"
+        "Hi %s,\n\n<one short friendly genuine line: introduce yourself by name and company, reference ONE specific detail about "
+        "their company/role that shows you actually looked, and that you can help add engineering capacity.>\n\nThanks,\n%s\n\n"
+        "Strict rules:\n1. The ENTIRE note MUST be under 300 characters total.\n2. Warm and human, not salesy, not formal. No 'Dear'.\n"
+        "3. No performance claims or numbers. No buzzwords. Never the word 'available'.\n4. No em dashes or en dashes; commas or periods.\n"
+        "5. Return ONLY the note text in the structure above. No commentary, no character count."
+        % (SENDER, AGENCY, c["FN"], role, c["COMP"], c["DESC"], c["JOB"] or "engineers", c["FN"], SENDER)
+    )
+    return _strip_dashes(_zai_chat(prompt, 240, 0.5, model=NOTE_MODEL))
+
+def _gen_first(row):
+    c = _ctx(row); role = (", " + c["ROLE"]) if c["ROLE"] else ""
+    prompt = (
+        "%s just accepted %s's LinkedIn connection. Write the FIRST message to send now.\n\n"
+        "Sender: %s from %s\nRecipient: %s%s\nTheir company does: %s\nThey are hiring: %s\n"
+        "Connection note already sent (do NOT repeat it): %s\n\n"
+        "Lead with sincere interest in THEIR work and goal. Add at most one modest genuine thought or a thoughtful question, "
+        "then the soft CTA. Brief and conversational, like a real person reaching out.\n\n%s\n\n"
+        "Rules:\n1. 350-470 characters.\n2. Sign off as %s.\n3. Return ONLY the message text. No commentary."
+        % (c["FN"], SENDER, SENDER, AGENCY, c["FN"], role, c["DESC"], c["JOB"] or "engineers",
+           row.get("connection_note") or "(none)", SHARED_RULES, SENDER)
+    )
+    return _strip_dashes(_zai_chat(prompt, 360, 0.5, model=NOTE_MODEL))
+
+def _gen_followup(row, n):
+    c = _ctx(row)
+    prior = "\n".join("- " + (m.get("text") or "") for m in (row.get("messages") or []))
+    prompt = (
+        "%s has not replied yet. Write follow-up #%d (a light, friendly nudge).\n\n"
+        "Sender: %s from %s\nRecipient: %s\nTheir company does: %s\nThey are hiring: %s\n"
+        "Messages already sent (take a genuinely DIFFERENT angle, do NOT repeat these):\n%s\n\n"
+        "Open with a light genuine thought or a curious question about their work from a NEW angle, then the soft CTA.\n\n%s\n\n"
+        "Rules:\n1. 220-360 characters.\n2. Sign off as %s.\n3. Return ONLY the message text. No commentary."
+        % (c["FN"], n, SENDER, AGENCY, c["FN"], c["DESC"], c["JOB"] or "engineers", prior or "(none)", SHARED_RULES, SENDER)
+    )
+    return _strip_dashes(_zai_chat(prompt, 320, 0.55, model=NOTE_MODEL))
+
+def _gen_interested_followups(row):
+    c = _ctx(row)
+    prior = "\n".join("- " + (m.get("text") or "") for m in (row.get("messages") or []))
+    reply = row.get("last_reply_text") or ""
+    reply_line = ('Their latest reply: "%s"' % reply) if reply else "They engaged and were marked interested."
+    prompt = (
+        "%s is an interested prospect (%s is the sender, from %s).\nTheir company does: %s\nThey are hiring: %s\n%s\n"
+        "Messages already sent:\n%s\n\n"
+        "Write 3 warm, curious, NON-SALESY follow-up messages, sent on DIFFERENT days, that must NOT repeat each other. "
+        'Return ONLY JSON: {"followups":["msg1","msg2","msg3"]}.\n\n'
+        "Each: open with a light genuine thought or a curious question about THEIR work from a genuinely DIFFERENT angle, then the soft CTA.\n\n%s\n\n"
+        "Hard rules:\n1. Each 220-360 chars, addressed to %s.\n2. Sign off as %s.\n3. It is fine that all three say 'tomorrow' (each is read on its own day)."
+        % (c["FN"], SENDER, AGENCY, c["DESC"], c["JOB"] or "engineers", reply_line, prior or "(none)", SHARED_RULES, c["FN"], SENDER)
+    )
+    txt = _zai_chat(prompt, 800, 0.6, model=REPLY_MODEL)
+    try:
+        m = re.search(r"\{.*\}", txt, re.S)
+        fus = json.loads(m.group(0)).get("followups", []) if m else []
+    except Exception:
+        fus = []
+    return [_strip_dashes(x) for x in fus][:3]
+
+def _schedule_first_followup(row):
+    row["followup_count"] = 0
+    row["followup_due_at"] = _time.time() + FOLLOWUP_DAYS[0] * DAY
+
+def _advance_followup(row, text):
+    msgs = row.get("messages") or []
+    msgs.append({"seq": len(msgs), "kind": "followup", "text": text, "at": _time.time()})
+    row["messages"] = msgs
+    row["followup_count"] = int(row.get("followup_count") or 0) + 1
+    row["followup_due_at"] = (_time.time() + FOLLOWUP_DAYS[row["followup_count"]] * DAY) if row["followup_count"] < MAX_FOLLOWUPS else None
+
+def _due_now(row, now):
+    if row.get("interested") and row.get("scheduled"):
+        return any((not m.get("sent")) and (m.get("sendAt") or 0) <= now for m in (row.get("scheduled_messages") or []))
+    if row.get("status") == "messaged" and not row.get("interested"):
+        d = row.get("followup_due_at")
+        return bool(d) and d <= now and int(row.get("followup_count") or 0) < MAX_FOLLOWUPS
+    return False
+
+def _has_pending(row):
+    if row.get("interested") and row.get("scheduled"):
+        return any(not m.get("sent") for m in (row.get("scheduled_messages") or []))
+    if row.get("status") == "messaged" and not row.get("interested"):
+        return bool(row.get("followup_due_at")) and int(row.get("followup_count") or 0) < MAX_FOLLOWUPS
+    return False
+
+def _in_tab(row, tab, now):
+    st = row.get("status")
+    closed = st in ("ignored", "stopped") or bool(row.get("closed_at"))
+    if tab == "closed":     return closed
+    if closed:              return False
+    if tab == "to_send":    return st == "queued"
+    if tab == "awaiting":   return st == "connection_sent"
+    if tab == "connected":  return st in ("connected", "messaged") and not row.get("interested")
+    if tab == "due":        return _due_now(row, now)
+    if tab == "scheduled":  return _has_pending(row)
+    if tab == "interested": return bool(row.get("interested"))
+    return False
+
+OUTREACH_TABS = ["to_send", "awaiting", "connected", "due", "scheduled", "interested", "closed"]
+
+def _outreach_payload(tab="to_send", q=""):
+    now = _time.time()
+    allrows = _load_outreach()
+    counts = {t: sum(1 for r in allrows if _in_tab(r, t, now)) for t in OUTREACH_TABS}
+    rows = [r for r in allrows if _in_tab(r, tab, now)]
+    if q:
+        ql = q.lower()
+        rows = [r for r in rows if ql in (r.get("company", "") + " " + r.get("dm_name", "") + " " +
+                r.get("dm_title", "") + " " + r.get("job_title", "")).lower()]
+    for r in rows:
+        r["_invite_age_days"] = int((now - r["connection_sent_at"]) / DAY) if r.get("connection_sent_at") else None
+        r["_stale"] = bool(r.get("_invite_age_days") is not None and r["_invite_age_days"] > STALE_INVITE_DAYS)
+    if tab in ("due", "scheduled"):
+        def _nd(r):
+            if r.get("interested") and r.get("scheduled"):
+                ds = [m.get("sendAt") or 0 for m in (r.get("scheduled_messages") or []) if not m.get("sent")]
+                return min(ds) if ds else 9e18
+            return r.get("followup_due_at") or 9e18
+        rows.sort(key=_nd)
+    else:
+        rows.sort(key=lambda r: r.get("created_at") or 0, reverse=True)
+    return {"tab": tab, "counts": counts, "rows": rows, "max_followups": MAX_FOLLOWUPS, "now": now}
+
+def _outreach_action(company, action, payload):
+    payload = payload or {}
+    row = _get_outreach(company)
+    if not row:
+        return {"error": "lead not found"}
+    now = _time.time()
+    if action == "generate_note":
+        row["connection_note"] = _gen_note(row); _save_outreach_row(row); return {"text": row["connection_note"]}
+    if action == "generate_first":
+        t = _gen_first(row); msgs = row.get("messages") or []
+        msgs.append({"seq": len(msgs), "kind": "first", "text": t, "at": now}); row["messages"] = msgs
+        _save_outreach_row(row); return {"text": t}
+    if action == "generate_followup":
+        return {"text": _gen_followup(row, int(row.get("followup_count") or 0) + 1)}
+    if action == "generate_schedule":
+        return {"drafts": _gen_interested_followups(row)}
+    if action == "enrich":
+        res = _co_enrich(row.get("dm_name", ""), row.get("company", ""), row.get("linkedin_url", ""))
+        if res.get("linkedin"): row["linkedin_url"] = res["linkedin"]
+        row["dm_email"] = res.get("email", ""); row["dm_phone"] = res.get("phone", "")
+        _save_outreach_row(row)
+        return {"linkedin": row.get("linkedin_url", ""), "email": res.get("email", ""), "phone": res.get("phone", "")}
+    if action == "mark_sent":
+        row["status"] = "connection_sent"; row["connection_sent_at"] = now
+    elif action == "mark_connected":
+        row["status"] = "connected"; row["connected_at"] = now
+    elif action == "decline":
+        row["status"] = "ignored"; row["closed_at"] = now
+    elif action == "mark_messaged":
+        txt = payload.get("text") or ""
+        if txt and not any(m.get("kind") == "first" for m in (row.get("messages") or [])):
+            msgs = row.get("messages") or []; msgs.append({"seq": len(msgs), "kind": "first", "text": txt, "at": now}); row["messages"] = msgs
+        row["status"] = "messaged"; _schedule_first_followup(row)
+    elif action == "mark_followup_sent":
+        if row.get("interested") and row.get("scheduled"):
+            pend = sorted([m for m in (row.get("scheduled_messages") or []) if not m.get("sent")], key=lambda m: m.get("sendAt") or 0)
+            if pend: pend[0]["sent"] = True; pend[0]["sentAt"] = now
+            if all(m.get("sent") for m in (row.get("scheduled_messages") or [])):
+                row["status"] = "stopped"; row["closed_at"] = now
+        else:
+            _advance_followup(row, payload.get("text") or "")
+            if row.get("followup_due_at") is None and int(row.get("followup_count") or 0) >= MAX_FOLLOWUPS:
+                row["status"] = "stopped"; row["closed_at"] = now
+    elif action == "replied":
+        row["interested"] = True; row["interested_at"] = now; row["last_reply_text"] = payload.get("reply") or ""
+        row["followup_due_at"] = None
+        if row.get("closed_at"): row["closed_at"] = None; row["status"] = "messaged"
+    elif action == "schedule":
+        sm = []
+        for i, m in enumerate(payload.get("messages") or []):
+            sm.append({"seq": i, "text": m.get("text") or "", "sendAt": m.get("sendAt") or (now + (i + 1) * DAY), "sent": False})
+        row["scheduled_messages"] = sm; row["scheduled"] = True
+        if not row.get("interested"): row["interested"] = True; row["interested_at"] = now
+    elif action == "close":
+        row["status"] = "stopped"; row["closed_at"] = now
+    elif action == "restore":
+        row["closed_at"] = None
+        row["status"] = ("messaged" if row.get("messages") or row.get("scheduled") else
+                         "connected" if row.get("connected_at") else
+                         "connection_sent" if row.get("connection_sent_at") else "queued")
+    else:
+        return {"error": "unknown action"}
+    _save_outreach_row(row)
+    return {"ok": True, "row": row}
+
 PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>HipHype Lead Finder</title>
@@ -424,7 +741,8 @@ a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 .jd summary{cursor:pointer;color:var(--acc)}
 .muted{color:var(--mut)}.status{margin-left:8px;color:var(--mut)}
 </style></head><body>
-<header><h1>HipHype Lead Finder</h1><span class="sub">funded · right-sized · hiring · worldwide</span></header>
+<header><h1>HipHype Lead Finder</h1><span class="sub">funded · right-sized · hiring · worldwide</span>
+<span style="flex:1"></span><a href="/outreach" class="navlink">LinkedIn Outreach →</a></header>
 <div class="wrap">
   <div class="panel" id="resultPanel">
     <div class="row" style="margin-top:0;margin-bottom:10px">
@@ -527,6 +845,170 @@ async function loadSaved(){try{const r=await fetch('/api/leads');const j=await r
 loadSaved();
 </script></body></html>"""
 
+OUTREACH_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HipHype Outreach</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>
+:root{--bg:#0f1115;--card:#171a21;--line:#262b36;--txt:#e6e8ee;--mut:#9aa3b2;--acc:#5b8cff;--good:#3fb950;--warn:#e0a23f;--bad:#e06c6c}
+*{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt)}
+header{padding:13px 22px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}
+h1{font-size:17px;margin:0}.sub{color:var(--mut);font-size:12px}
+a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+button{background:var(--acc);color:#fff;border:0;padding:7px 13px;border-radius:7px;font-weight:600;cursor:pointer;font-size:13px}
+button.sec{background:#222836;color:var(--txt);border:1px solid var(--line)}
+button.ghost{background:transparent;color:var(--mut);border:1px solid var(--line)}
+button:disabled{opacity:.5;cursor:wait}
+input,textarea{background:#0f1218;border:1px solid var(--line);border-radius:7px;color:var(--txt);font:inherit;padding:8px 10px;width:100%}
+textarea{resize:vertical;min-height:90px;white-space:pre-wrap}
+.wrap{padding:16px 22px;max-width:1000px;margin:0 auto}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+.tab{padding:7px 12px;border-radius:8px;background:#171a21;border:1px solid var(--line);color:var(--mut);cursor:pointer;font-size:13px}
+.tab.on{background:#1d2533;color:var(--txt);border-color:var(--acc)}
+.tab .n{background:#2a3142;border-radius:10px;padding:0 6px;margin-left:6px;font-size:11px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:12px}
+.card h3{margin:0;font-size:15px}
+.meta{color:var(--mut);font-size:12px;margin-top:2px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
+.tag{font-size:11px;padding:2px 8px;border-radius:20px;background:#1c2330;color:var(--mut)}
+.tag.fit{color:var(--good)}.tag.stale{background:#3a2118;color:var(--warn)}
+.empty{color:var(--mut);padding:36px;text-align:center}
+.cc{color:var(--mut);font-size:11px;margin-top:4px}
+.quote{border-left:3px solid var(--acc);padding:4px 10px;color:var(--mut);font-size:13px;margin-top:8px;white-space:pre-wrap}
+.sched{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-top:8px;font-size:13px}
+.dt{width:auto;display:inline-block}
+</style></head><body>
+<header><h1>HipHype Outreach</h1><span class="sub">manual · AI-assisted · you send by hand</span>
+<span style="flex:1"></span>
+<input id="q" placeholder="Search company / name / role" style="width:230px" oninput="onSearch()">
+<button class="sec" onclick="syncLeads(this)">Sync from leads</button>
+<a href="/" class="sec" style="padding:7px 13px;border-radius:7px">← Leads</a></header>
+<div class="wrap"><div class="tabs" id="tabs"></div><div id="list"></div></div>
+<script>
+const $=id=>document.getElementById(id);
+const TABS=[['to_send','To Send'],['awaiting','Awaiting'],['connected','Connected'],['due','Follow-ups Due'],['scheduled','Scheduled'],['interested','Interested'],['closed','Closed']];
+let TAB='to_send',ROWS=[],COUNTS={},MAXF=3,NOW=0,Q='',timer=null;
+function el(t,p,kids){const e=document.createElement(t);if(p)for(const k in p){if(k==='text')e.textContent=p[k];else if(k==='cls')e.className=p[k];else if(k.slice(0,2)==='on')e[k]=p[k];else e.setAttribute(k,p[k]);}(kids||[]).forEach(c=>{if(c==null)return;e.appendChild(typeof c==='string'?document.createTextNode(c):c);});return e;}
+function safeUrl(u){return (typeof u==='string'&&/^https?:\/\//i.test(u))?u:null;}
+function fmtDate(ts){if(!ts)return '';const d=new Date(ts*1000);return d.toLocaleDateString(undefined,{month:'short',day:'numeric'})+', '+d.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});}
+function toLocalInput(ts){const d=new Date(ts*1000);d.setMinutes(d.getMinutes()-d.getTimezoneOffset());return d.toISOString().slice(0,16);}
+function copyBtn(getText){return el('button',{cls:'sec',onclick:async function(){try{await navigator.clipboard.writeText(getText());const o=this.textContent;this.textContent='Copied';setTimeout(()=>this.textContent=o,1200);}catch(e){this.textContent='Copy failed';}},text:'Copy'});}
+async function api(action,company,payload){const r=await fetch('/api/outreach/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({company:company,action:action,payload:payload||{}})});return r.json();}
+async function act(action,company,payload){await api(action,company,payload);load();}
+async function load(){try{const r=await fetch('/api/outreach?tab='+encodeURIComponent(TAB)+'&q='+encodeURIComponent(Q));const j=await r.json();ROWS=j.rows||[];COUNTS=j.counts||{};MAXF=j.max_followups||3;NOW=j.now||0;renderTabs();renderList();}catch(e){$('list').textContent='Error loading.';}}
+function renderTabs(){const c=$('tabs');c.replaceChildren();TABS.forEach(function(p){const k=p[0],label=p[1];const t=el('div',{cls:'tab'+(k===TAB?' on':''),onclick:()=>{TAB=k;Q='';$('q').value='';load();}},[label]);const n=COUNTS[k]||0;if(n)t.appendChild(el('span',{cls:'n',text:String(n)}));c.appendChild(t);});}
+function syncLeads(b){b.disabled=true;b.textContent='Syncing…';fetch('/api/outreach/sync',{method:'POST'}).then(r=>r.json()).then(j=>{b.disabled=false;b.textContent='Sync from leads';load();});}
+function onSearch(){clearTimeout(timer);timer=setTimeout(()=>{Q=$('q').value.trim();load();},300);}
+
+function gbtn(label,action,company,cb){const b=el('button',{text:label});b.onclick=async()=>{b.disabled=true;const o=b.textContent;b.textContent='Generating…';try{const j=await api(action,company);cb(j);}catch(e){alert('Generation failed');}b.disabled=false;b.textContent=o;};return b;}
+function textArea(val){const ta=el('textarea',{},[]);ta.value=val||'';return ta;}
+function charLine(ta){const cc=el('div',{cls:'cc',text:(ta.value||'').length+' chars'});ta.addEventListener('input',()=>cc.textContent=ta.value.length+' chars');return cc;}
+
+function head(row){
+  const h=el('div',{},[el('h3',{text:row.company||''}),el('div',{cls:'meta',text:(row.dm_name||'')+(row.dm_title?(' · '+row.dm_title):'')})]);
+  if(row.job_title)h.appendChild(el('div',{cls:'meta',text:'hiring: '+row.job_title}));
+  const tr=el('div',{cls:'row'},[]);
+  if(row.fit_score)tr.appendChild(el('span',{cls:'tag fit',text:'fit '+row.fit_score+'/10'}));
+  const lu=safeUrl(row.linkedin_url);
+  if(lu)tr.appendChild(el('a',{href:lu,target:'_blank',rel:'noopener noreferrer'},['Open LinkedIn']));
+  else tr.appendChild(el('span',{cls:'tag',text:'no LinkedIn URL yet'}));
+  if(row.dm_email)tr.appendChild(el('span',{cls:'tag',text:row.dm_email}));
+  h.appendChild(tr);
+  return h;
+}
+function repliedBox(row){
+  const inp=el('input',{placeholder:'Paste what they said…'});
+  const b=el('button',{cls:'sec',text:'They replied',onclick:()=>{act('replied',row.company,{reply:inp.value});}});
+  return el('div',{cls:'row'},[inp,b]);
+}
+
+function buildCard(row){
+  const c=el('div',{cls:'card'},[head(row)]);
+  const co=row.company;
+  if(TAB==='to_send'){
+    if(!safeUrl(row.linkedin_url))
+      c.appendChild(el('div',{cls:'row'},[gbtn('Find LinkedIn (enrich)','enrich',co,()=>load())]));
+    const box=el('div',{},[]);c.appendChild(box);
+    const show=note=>{box.replaceChildren();const ta=textArea(note);box.appendChild(ta);box.appendChild(el('div',{cls:'row'},[copyBtn(()=>ta.value),el('button',{text:'Mark sent',onclick:()=>act('mark_sent',co)}),el('button',{cls:'ghost',text:'Skip',onclick:()=>act('decline',co)})]));box.appendChild(charLine(ta));};
+    if(row.connection_note)show(row.connection_note);
+    else box.appendChild(el('div',{cls:'row'},[gbtn('Generate connection note','generate_note',co,j=>show(j.text||'')),el('button',{cls:'ghost',text:'Skip',onclick:()=>act('decline',co)})]));
+  }
+  else if(TAB==='awaiting'){
+    const age=row._invite_age_days; const m=el('div',{cls:'meta',text:age==null?'invite sent':('invited '+age+'d ago')});c.appendChild(m);
+    const r=el('div',{cls:'row'},[el('button',{text:'Mark connected',onclick:()=>act('mark_connected',co)}),el('button',{cls:'ghost',text:'Declined / ignore',onclick:()=>act('decline',co)})]);
+    if(row._stale)r.appendChild(el('span',{cls:'tag stale',text:'stale >'+'30d'}));
+    c.appendChild(r);
+  }
+  else if(TAB==='connected'){
+    const first=(row.messages||[]).filter(m=>m.kind==='first').slice(-1)[0];
+    const box=el('div',{},[]);c.appendChild(box);
+    const show=t=>{box.replaceChildren();const ta=textArea(t);box.appendChild(ta);box.appendChild(el('div',{cls:'row'},[copyBtn(()=>ta.value),el('button',{text:'Mark messaged',onclick:()=>act('mark_messaged',co,{text:ta.value})})]));box.appendChild(charLine(ta));};
+    if(first)show(first.text);
+    else box.appendChild(el('div',{cls:'row'},[gbtn('Generate first message','generate_first',co,j=>show(j.text||''))]));
+    c.appendChild(repliedBox(row));
+  }
+  else if(TAB==='due'){
+    if(row.interested&&row.scheduled){
+      const due=(row.scheduled_messages||[]).filter(m=>!m.sent&&(m.sendAt||0)<=NOW).sort((a,b)=>a.sendAt-b.sendAt)[0];
+      if(due){const ta=textArea(due.text);c.appendChild(el('div',{cls:'meta',text:'scheduled follow-up due '+fmtDate(due.sendAt)}));c.appendChild(ta);c.appendChild(el('div',{cls:'row'},[copyBtn(()=>ta.value),el('button',{text:'Mark sent',onclick:()=>act('mark_followup_sent',co)})]));}
+    } else {
+      const n=(row.followup_count||0)+1;
+      c.appendChild(el('div',{cls:'meta',text:'auto follow-up #'+n+' of '+MAXF+' due'}));
+      const box=el('div',{},[]);c.appendChild(box);
+      const show=t=>{box.replaceChildren();const ta=textArea(t);box.appendChild(ta);box.appendChild(el('div',{cls:'row'},[copyBtn(()=>ta.value),el('button',{text:'Mark sent',onclick:()=>act('mark_followup_sent',co,{text:ta.value})})]));box.appendChild(charLine(ta));};
+      box.appendChild(el('div',{cls:'row'},[gbtn('Generate follow-up','generate_followup',co,j=>show(j.text||''))]));
+      c.appendChild(repliedBox(row));
+    }
+  }
+  else if(TAB==='scheduled'){
+    if(row.interested&&row.scheduled){
+      (row.scheduled_messages||[]).filter(m=>!m.sent).sort((a,b)=>a.sendAt-b.sendAt).forEach(m=>{
+        const due=(m.sendAt||0)<=NOW;
+        c.appendChild(el('div',{cls:'sched'},[el('div',{cls:'meta',text:(due?'DUE now · ':'')+fmtDate(m.sendAt)}),el('div',{text:m.text})]));
+      });
+    } else {
+      const n=(row.followup_count||0)+1; const due=(row.followup_due_at||0)<=NOW;
+      c.appendChild(el('div',{cls:'sched'},[el('div',{cls:'meta',text:'auto follow-up #'+n+' of '+MAXF+' · '+(due?'DUE now':fmtDate(row.followup_due_at))})]));
+    }
+    c.appendChild(el('div',{cls:'meta',text:'(actionable in the Follow-ups Due tab)'}));
+  }
+  else if(TAB==='interested'){
+    if(row.last_reply_text)c.appendChild(el('div',{cls:'quote',text:row.last_reply_text}));
+    if(row.scheduled&&(row.scheduled_messages||[]).length){
+      (row.scheduled_messages||[]).forEach((m,i)=>c.appendChild(el('div',{cls:'sched'},[el('div',{cls:'meta',text:'#'+(i+1)+' · '+(m.sent?'sent':('send '+fmtDate(m.sendAt)))}),el('div',{text:m.text})])));
+      c.appendChild(el('div',{cls:'row'},[el('button',{cls:'ghost',text:'Cancel lead',onclick:()=>act('close',co)})]));
+    } else {
+      const box=el('div',{},[]);c.appendChild(box);
+      box.appendChild(el('div',{cls:'row'},[gbtn('Schedule 3 follow-ups','generate_schedule',co,j=>schedEditor(box,row,j.drafts||[])),el('button',{cls:'ghost',text:'Cancel lead',onclick:()=>act('close',co)})]));
+    }
+  }
+  else if(TAB==='closed'){
+    c.appendChild(el('div',{cls:'meta',text:'closed ('+(row.status||'')+')'}));
+    c.appendChild(el('div',{cls:'row'},[el('button',{cls:'sec',text:'Restore',onclick:()=>act('restore',co)})]));
+  }
+  return c;
+}
+
+function schedEditor(box,row,drafts){
+  box.replaceChildren();
+  const rows=[];
+  for(let i=0;i<3;i++){
+    const ta=textArea(drafts[i]||'');
+    const dt=el('input',{type:'datetime-local',cls:'dt'});dt.value=toLocalInput(NOW+(i+1)*86400);
+    box.appendChild(el('div',{cls:'sched'},[el('div',{cls:'meta',text:'Follow-up #'+(i+1)}),ta,el('div',{cls:'row'},[el('span',{cls:'meta',text:'send at'}),dt]),charLine(ta)]));
+    rows.push({ta,dt});
+  }
+  box.appendChild(el('div',{cls:'row'},[el('button',{text:'Approve & schedule',onclick:()=>{const messages=rows.map(r=>({text:r.ta.value,sendAt:Math.floor(new Date(r.dt.value).getTime()/1000)}));act('schedule',row.company,{messages:messages});}}),el('button',{cls:'ghost',text:'Regenerate',onclick:async()=>{const j=await api('generate_schedule',row.company);schedEditor(box,row,j.drafts||[]);}})]));
+}
+
+function renderList(){
+  const c=$('list');c.replaceChildren();
+  if(!ROWS.length){c.appendChild(el('div',{cls:'empty',text:TAB==='to_send'?'Nothing queued. Click “Sync from leads” to pull in qualified leads.':'Nothing here.'}));return;}
+  ROWS.forEach(r=>c.appendChild(buildCard(r)));
+}
+load();
+</script></body></html>"""
+
 # Yellow favicon (rounded square + dark "H" for HipHype), served inline — no binary file needed.
 FAVICON = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
@@ -542,12 +1024,20 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code); self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
     def do_GET(self):
-        if self.path == "/" or self.path.startswith("/?"):
+        parsed = urllib.parse.urlparse(self.path)
+        path, qs = parsed.path, urllib.parse.parse_qs(parsed.query)
+        if path == "/":
             self._send(200, "text/html; charset=utf-8", PAGE.encode())
-        elif self.path in ("/favicon.svg", "/favicon.ico"):
+        elif path == "/outreach":
+            self._send(200, "text/html; charset=utf-8", OUTREACH_PAGE.encode())
+        elif path in ("/favicon.svg", "/favicon.ico"):
             self._send(200, "image/svg+xml", FAVICON)
-        elif self.path == "/api/leads":
+        elif path == "/api/leads":
             self._send(200, "application/json", json.dumps({"leads": _load_leads()}).encode())
+        elif path == "/api/outreach":
+            tab = (qs.get("tab", ["to_send"])[0]) or "to_send"
+            q = (qs.get("q", [""])[0]) or ""
+            self._send(200, "application/json", json.dumps(_outreach_payload(tab, q)).encode())
         else:
             self._send(404, "text/plain", b"not found")
     def do_POST(self):
@@ -568,6 +1058,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, "application/json", json.dumps(res).encode())
             except Exception as e:
                 self._send(500, "application/json", json.dumps({"error": str(e)}).encode())
+        elif self.path == "/api/outreach/sync":
+            try:
+                self._send(200, "application/json", json.dumps({"created": _outreach_intake()}).encode())
+            except Exception as e:
+                self._send(500, "application/json", json.dumps({"error": str(e)}).encode())
+        elif self.path == "/api/outreach/action":
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                req = json.loads(self.rfile.read(n) or b"{}")
+                res = _outreach_action(req.get("company", ""), req.get("action", ""), req.get("payload", {}))
+                self._send(200, "application/json", json.dumps(res).encode())
+            except Exception as e:
+                self._send(500, "application/json", json.dumps({"error": str(e)}).encode())
         else:
             self._send(404, "text/plain", b"not found")
 
@@ -577,7 +1080,8 @@ def _run_pipeline_once(tag="CRON"):
     try:
         ls = find_leads({})
         _persist(ls)
-        print("%s %s: %d new leads this run; %d stored total" % (tag, stamp, len(ls), len(_load_leads())), flush=True)
+        queued = _outreach_intake()   # auto-queue qualifying new leads into the outreach worklist
+        print("%s %s: %d new leads this run; %d stored total; %d queued for outreach" % (tag, stamp, len(ls), len(_load_leads()), queued), flush=True)
     except Exception as e:
         print("%s %s error: %s" % (tag, stamp, e), flush=True)
 

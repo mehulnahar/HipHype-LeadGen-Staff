@@ -6,6 +6,7 @@
 # local data (DB is the source of truth in prod)
 leads.json
 seen_companies.json
+outreach.json
 
 # python
 __pycache__/
